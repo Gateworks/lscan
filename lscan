@@ -1,0 +1,1925 @@
+#!/usr/bin/python
+
+# Copyright (C) 2016 Gateworks Corporation <support@gateworks.com>
+# Author: Pushpal Sidhu <psidhu@gateworks.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Some Notes:
+#  * Do not care about 0-byte files, assume body content as license, not name
+#  * I recommend using 'wkhtmltopdf lscan-single-index.html lscan-single-index.pdf'
+#    for a single PDF containing license info
+
+# Libraries we want to use
+import argparse           # getopt
+import os                 # OS file commands
+import sys                # raw read/writes
+import time               # Get file modified time
+import hashlib            # sha256 files
+import pickle             # pickle serialization (data dumping)
+import copy               # deepcopy
+import string             # Used for string replace
+import fnmatch            # filematching support
+import re                 # regex matching
+import shutil             # Copy a single file
+import multiprocessing    # subprocess data parsing; using this over threads
+                          # due to python threading inadequacies (larger memory)
+
+class MyUtil(object):
+    """Common utility functions, created for global use"""
+    def __init__(self, gdbg=0, ansi=True, jobs=2):
+        self.gdbg = gdbg
+        self.ansi = ansi
+        self.jobs = jobs
+        self.sysout_lock = multiprocessing.Lock()
+        self.fs_lock = multiprocessing.Lock()
+        self.readinsize = 5120  # ~ 5k
+
+        # Print Color Codes
+        attr = {'clear':'0', 'bold':'1', 'underline':'4', 'negative':'7'}
+        fore = {'clear':'0', 'black':'30', 'red':'31', 'green':'32',
+                'yellow':'33', 'blue':'34', 'purple':'35', 'teal':'36',
+                'white':'37'}
+        back = {'clear':'0', 'black':'40', 'red':'41', 'green':'42',
+                'yellow':'43', 'blue':'44', 'purple':'45', 'teal':'46',
+                'white':'47'}
+        self.codes = {
+            'err'     : attr['bold'] + ';' + fore['red'] + "mERROR:",
+            'warn'    : attr['bold'] + ';' + fore['teal'] + "mWARNING:",
+            'missing' : attr['bold'] + ';' + fore['yellow'] + "m ",
+            'info'    : attr['bold'] + ';' + fore['blue'] + "mInfo:",
+            'dbg'     : attr['clear'] + ';' + fore['purple'] + "mDBG:",
+            'todo'    : attr['bold'] + ';' + fore['yellow'] + ';' + \
+            back['black'] + "mTODO:",
+            'clear' : '0;0;0m'
+        }
+
+        self.html_css = '<style type="text/css">' + \
+        'body { padding: 0; font-family: sans-serif; }' + \
+        '.project { background-color: #EEEEEE; border-top: 10px solid white; padding: 10px; }' + \
+        '.label { font-weight: bold; }' + \
+        '.license-list { margin-left: 1em; color: black; }' + \
+        '.not-found { font-style: italic; color: red; }' + \
+        '.disclaimer { font-style: italic; }' + \
+        '</style>'
+
+    def __ansi_print(self, code, msg, console=True):
+        """Print to console (or if false, to stderr)"""
+        self.sysout_lock.acquire()
+        if self.ansi:
+            if console:
+                sys.stdout.write('\033[%s' % self.codes[code])
+                sys.stdout.write(msg)
+                sys.stdout.write('\033[%s' % self.codes['clear'] + '\n')
+                sys.stdout.flush()
+            else:
+                sys.stderr.write('\033[%s' % self.codes[code])
+                sys.stderr.write(msg)
+                sys.stderr.write('\033[%s' % self.codes['clear'] + '\n')
+                sys.stderr.flush()
+        else:
+            print msg
+        self.sysout_lock.release()
+
+    def dbg(self, lvl, msg):
+        """Print Debug Messages"""
+        if int(self.gdbg) >= int(lvl):
+            self.__ansi_print('dbg', msg)
+
+    def printmissing(self, msg):
+        """Print message on missing package"""
+        self.__ansi_print('missing', msg)
+
+    def printtodo(self, msg):
+        """Print todo messages to stderr"""
+        self.__ansi_print('todo', msg, False)
+
+    def printerr(self, msg):
+        """Print error messages to stderr"""
+        self.__ansi_print('err', msg, False)
+
+    def printwarning(self, msg):
+        """Print info messages"""
+        self.__ansi_print('warn', msg)
+
+    def printinfo(self, msg):
+        """Print info messages"""
+        self.__ansi_print('info', msg)
+
+    def run_jobs(self, procs, q, maxjobs=None):
+        """
+        Wait for parsing to finish (use queue)
+        Below 'jobs' thing is an optimization (don't use 6+ gb of memory)
+        Assume all in procs list have same calling func
+        """
+
+        jobs = self.jobs
+        if maxjobs:
+            if maxjobs < self.jobs:
+                jobs = maxjobs
+
+        # Note: I read the source of multithreading to find _target, not
+        # the "right" way of doing things since _target is supposed to be
+        # protected... but python
+        util.dbg(
+            1,
+            "run_jobs: executing '%s' %d times, with max of %d running at once"
+            % (str(procs[0]._target.__name__), len(procs), jobs)
+        )
+
+        tmp_data = []
+        init_jobs = jobs
+        for p in procs:
+            # Initial Start
+            if not init_jobs == 0:
+                p.start()
+                init_jobs -= 1
+                continue
+
+            tmp_data.append(q.get())
+            p.start()
+
+        leftovers = jobs
+        if len(procs) < jobs:
+            leftovers = len(procs)
+
+        # Cleanup last of processes'
+        for i in range(leftovers):
+            tmp_data.append(q.get())
+
+        util.dbg(
+            1,
+            "run_jobs: done executing '%s'"
+            % (str(procs[0]._target.__name__))
+        )
+        return tmp_data
+
+    def sha256_file(self, filelocation):
+        """
+        generate key on the file located at filelocation for db insertion
+        result should be same as sha256sum
+        """
+        try:
+            if os.stat(filelocation).st_size == 0:
+                return None
+        except:
+            return None
+
+        self.fs_lock.acquire()
+        try:
+            with open(filelocation, 'rb') as f:
+                self.fs_lock.release()
+                return hashlib.sha256(f.read()).hexdigest()
+        except IOError:
+            util.printerr("Can't open file at " + str(filelocation))
+
+        self.fs_lock.release()
+        return None
+
+    def sha256_string(self, string):
+        """
+        generate key on the passed in string
+        result should be same as sha256sum
+        """
+        return hashlib.sha256(string).hexdigest()
+
+    def remove_dups(self, path):
+        """Remove dup files from path"""
+        uniq = []
+        for root, dirs, files in os.walk(path):
+            for f in files:
+                fpath = os.path.join(root, f)
+                key = self.sha256_file(fpath)
+                if key not in uniq:
+                    uniq.append(key)
+                else:
+                    os.remove(fpath)
+
+    def reassoc(self, name, check_list):
+        assoc = name
+        for renamed in check_list:
+            r_stripped = os.path.splitext(renamed)[0]
+            if name == r_stripped:
+                assoc = renamed
+                break
+        return assoc
+
+    def find_name_in_parent_dirs(self, name, start_dir, top_dir='/',
+                                 dirflag=True, fileflag=True):
+        """Return path of file/dirname traversing upwards"""
+
+        if not dirflag and not fileflag:
+            return None
+
+        top_dir = os.path.normpath(top_dir)
+        pdir = os.path.abspath(start_dir)
+        nflag = False # name found flag
+        while not nflag:
+            # too far, not found
+            if pdir.endswith(top_dir):
+                util.printerr(
+                    "Could not find %s in parent dirs of %s" % (name, start_dir)
+                )
+                break
+
+            # Get this dirs listing
+            for f in os.listdir(pdir):
+                if f.endswith(name):
+                    if dirflag and fileflag:
+                        nflag = True
+                    elif dirflag:
+                        if os.path.isdir(f):
+                            nflag = True
+                    elif fileflag:
+                        if os.path.isfile(f):
+                            nflag = True
+
+                if nflag:
+                    return pdir
+
+            # Go up a dir
+            pdir = os.path.abspath(os.path.join(pdir, os.pardir))
+
+        return None
+
+    def find_dir(self, name, path):
+        """Find all matching dir name under path"""
+        ret = []
+        for root, dirs, files in os.walk(path):
+            if name in dirs:
+                ret.append(os.path.join(root, name))
+
+        return ret
+
+    def find_file(self, name, path):
+        """Return all matching file name in dir"""
+        ret = []
+        for root, dirs, files in os.walk(path):
+            if name in files:
+                ret.append(os.path.join(root, name))
+
+        return ret
+
+    def find_file_p(self, pattern, path):
+        """Return list of files matching pattern in dir (slow)"""
+        ret = []
+        for root, dirs, files in os.walk(path):
+            for f in files:
+                if fnmatch.fnmatch(f, pattern):
+                    ret.append(os.path.join(root, f))
+
+        return ret
+
+    def html_header(self, index_html, ldb, pdb):
+        """
+        assume index_html is opened for writting
+        """
+        index_html.write('<html><head>\n')
+        index_html.write(self.html_css + '\n')
+        index_html.write(
+            '</head>\n' + \
+            '<body ' + \
+            'leftmargin=".5" rightmargin=".5" bottommargin=".5" topmargin=".5"' + \
+            ' >\n'
+        )
+
+        tot_projects = len(pdb.db[pdb.projects])
+        lics_found = [
+            pdb.db[pdb.projects][i]['license_list']
+            for i in pdb.db[pdb.projects]
+            if len(pdb.db[pdb.projects][i]['license_list']) != 0
+        ]
+        lics_found = [
+            item[1] for sublist in lics_found for item in sublist
+        ]
+        lics_found = list(set(lics_found))
+        lics_not_found = len(
+            [i for i in pdb.db[pdb.projects]
+             if len(pdb.db[pdb.projects][i]['license_list']) == 0]
+        )
+        if pdb.db[pdb.extra]['android']:
+            tot_installed_files = len(pdb.db[pdb.extra]['installed'])
+            index_html.write(
+                '<h3>Stats:</h3>\n'
+                '<div>\n'
+                'Total Number of Installed Files: %s</br>\n'
+                'Total Number of Projects Determined: %s</br>\n'
+                'Total Number of Unique Licenses Found: %s</br>\n'
+                'Licenses Not Found for %s installed file(s)'
+                ' (Projects Without Legalese + Unmatched Files)\n'
+                '</div>\n' % (
+                    str(tot_installed_files), str(tot_projects),
+                    str(len(lics_found)), str(lics_not_found)
+                )
+            )
+        else:
+            index_html.write(
+                '<h3>Stats:</h3>\n'
+                '<div>\n'
+                'Total Number of Projects: %s</br>\n'
+                'Total Number of Unique Licenses Found: %s</br>\n'
+                'Licenses Not Found for %s Project(s)\n'
+                '</div>\n' % (
+                    str(tot_projects), str(len(lics_found)),
+                    str(lics_not_found),
+                )
+            )
+
+    def html_body(self, index_html, ldb, pdb, single=False):
+        # use toc class to use hrefs
+        index_html.write(
+            '<h3>Project List:</h3>\n' + \
+            '<div class="toc">\n' + \
+            '<ul>\n'
+        )
+        for key in sorted(pdb.db[pdb.projects], key=lambda s: s.lower()):
+            if not len(pdb.db[pdb.projects][key]['license_list']) == 0:
+                index_html.write(
+                    '<li><a href="#toc%s">%s</a></li>\n' % (key, key)
+                )
+            else:
+                index_html.write(
+                    '<li><a href="#toc%s" class="not-found">' % key + \
+                    '%s - '  % key + \
+                    'No license info found; please inspect "%s" manually' %
+                    pdb.db[pdb.projects][key]['project_location'] + \
+                    '</a></li>\n'
+                )
+
+        index_html.write(
+            '</ul>\n' +
+            '</div>\n'
+        )  # / toc
+
+        # Now table database
+        index_html.write(
+            '<table cellpadding="0" cellspacing="0" border="0">'
+        )
+        for key in sorted(pdb.db[pdb.projects], key=lambda s: s.lower()):
+            index_html.write(
+                '<tr id="toc%s"><td class="project">\n' % key
+            )
+            index_html.write(
+                '<div class="label">%s information:</div>\n' % key +
+                '<div class="license-list">\n'
+            )
+            if pdb.db[pdb.extra]['android']:
+                index_html.write(
+                    '<h5>Project Location: </h5>\n' +
+                    '%s</br>\n' % pdb.db[pdb.projects][str(key)]['project_location'].replace(
+                        pdb.db[pdb.extra]['adir'], ''
+                    )
+                )
+
+                index_html.write(
+                    '<h5>Installed files that added this project:</h5>\n'
+                )
+                uniq_assocs = []
+                if key in pdb.db[pdb.extra]['projects']:
+                    uniq_assocs = list(set(
+                        pdb.db[pdb.extra]['projects'][key]['assoc-files'])
+                    )
+
+                    iout = [
+                        pdb.db[pdb.extra]['installed'][i]['location']
+                        for i in sorted(uniq_assocs, key=lambda s: s.lower())
+                    ]
+                    for i in sorted(iout):
+                        index_html.write(
+                            '%s</br>\n' % (
+                                i.replace(pdb.db[pdb.extra]['out_dir'], ''
+                                )
+                            )
+                        )
+
+            index_html.write(
+                '<h5>Licenses determined by:</h5>\n'
+            )
+            tmp_lic_list = []
+            for loc,lic in \
+                sorted(pdb.db[pdb.projects][key]['license_list']):
+                tmp_lic_list.append(lic)
+                lpath = ldb.db[lic]['location']
+                if single:
+                    index_html.write(
+                        '<a href="#stoc%s">%s</a></br>\n' % (
+                            lic, loc.replace(pdb.db[pdb.extra]['adir'], '')
+                        )
+                    )
+                else:
+                    index_html.write(
+                        '<a href="%s">%s</a></br>\n' % (
+                            lpath, loc.replace(pdb.db[pdb.extra]['adir'], '')
+                        )
+                    )
+
+            uniq_licenses = list(set(tmp_lic_list))
+            index_html.write(
+                '<h5>Unique license content:</h5>\n'
+            )
+            for lic in sorted(uniq_licenses):
+                if single:
+                    index_html.write(
+                        '<h7 id="stoc%s" class="disclaimer">%s:</h7></br>' % (lic, lic)
+                    )
+
+                    for line in ldb.db[lic]['file']:
+                        index_html.write(
+                            '%s</br>' % line
+                        )
+
+                    index_html.write(
+                        '</br>'
+                    )
+
+                else:
+                    index_html.write(
+                        '<a href="%s">%s</a></br>\n' % (ldb.db[lic]['location'], lic)
+                    )
+            # Write in any disclaimers
+            if not len(pdb.db[pdb.projects][key]['disclaimer']) == 0:
+                index_html.write(
+                    '<h5>Disclaimers Found:</h5>\n'
+                )
+            for d in pdb.db[pdb.projects][key]['disclaimer']:
+                index_html.write('<h7 class="disclaimer">%s: </h7>' % str(d). \
+                                 replace(pdb.db[pdb.extra]['adir'], ''))
+                for line in pdb.db[pdb.projects][key]['disclaimer'][d]:
+                    index_html.write('%s' % line)
+                index_html.write('</br></br>\n')
+
+            index_html.write(
+                '</div>\n'
+            ) # license-list
+            index_html.write(
+                '</td></tr>\n\n\n'
+            ) # end table entry for license
+
+        # End table
+        index_html.write(
+            '</table>\n'
+        )
+
+    def html_footer(self, index_html, ldb, pdb):
+        # End html file
+        index_html.write(
+            '</body></html>\n'
+        )
+
+    def create_output(self, ldb, pdb):
+        self.create_single_page_output(ldb, pdb)
+        self.create_html_output(ldb, pdb)
+
+    def create_single_page_output(self, ldb, pdb,
+                                  filename="./lscan-single-index.html"):
+        """
+        Create a single, large output of licenses
+        Print all licenses associated per project, no html linking
+        """
+        with open(filename, "wb") as index_html:
+            # Create header
+            self.html_header(index_html, ldb, pdb)
+            self.html_body(index_html, ldb, pdb, single=True)
+            self.html_footer(index_html, ldb, pdb)
+
+    def create_html_output(self, ldb, pdb, filename="./lscan-index.html"):
+        """
+        Create toc style html page (normal)
+        """
+
+        with open(filename, "wb") as index_html:
+            # Create header
+            self.html_header(index_html, ldb, pdb)
+            self.html_body(index_html, ldb, pdb, single=False)
+            self.html_footer(index_html, ldb, pdb)
+
+# Global Class usage
+util = MyUtil()
+
+class DataBase(object):
+    """Parent database class"""
+
+    def __init__(self, dbfile="./db.pickle"):
+        self.__dbfile = dbfile
+        self.name = os.path.basename(self.__dbfile)
+        self.db = {}
+        self.db_lock = multiprocessing.Lock()
+
+    def __del__(self):
+        """R.I.B."""
+        pass
+
+    def printdb(self):
+        """Print Self"""
+        print str(self.db)
+
+    def savedb(self):
+        """Write db object out to file and close it"""
+        self.db_lock.acquire()
+        try:
+            with open(self.__dbfile, 'w') as f:
+                try:
+                    pickle.dump(self.db, f)
+                except:
+                    util.printerr("Cannot save database to " + str(f.name))
+        except IOError:
+            util.printerr("Cannot open '%s'" % str(self.__dbfile))
+
+        self.db_lock.release()
+
+    def loaddb(self):
+        """Read db object into object"""
+        self.db_lock.acquire()
+
+        try:
+            with open(self.__dbfile, 'r') as f:
+                try:
+                    self.db = pickle.load(f)
+                except:
+                    util.printerr("pickle load error, empty db")
+                    # Just create it on the fly
+                    self.db = {}
+        except IOError:
+            self.db = {}
+
+        self.db_lock.release()
+
+class LicenseDataBase(DataBase):
+    """Class used to maintain license data base"""
+
+    def __init__(self, lpath="./list-of-licenses", dbfile="./ldb.pickle"):
+        # Init Parent
+        DataBase.__init__(self, dbfile=dbfile)
+
+        # Save input to self vars
+        self.lpath = lpath
+
+    def __del__(self):
+        """R.I.B."""
+        pass
+
+    def recreate_file_list(self, new_path=None):
+        """Recreate file list from data-base"""
+        if new_path is None:
+            new_path = self.lpath
+
+        if not os.path.exists(new_path):
+            try:
+                os.makedirs(new_path)
+            except:
+                util.printerr("Making '%s' failed, bailing..." % new_path)
+                return False
+
+        for key in self.db:
+            # write to new dir
+            new_location = string.replace(
+                self.db[key]['location'],
+                os.path.dirname(self.db[key]['location']), new_path
+            )
+            if os.path.exists(new_location):
+                nlkey = util.sha256_file(new_location)
+                if key == nlkey:
+                    util.dbg(3, new_location + " already exists, skipping...")
+                    continue
+                else:
+                    util.printwarning(
+                        new_location + " already exists and has a " +
+                        "different sha256!!!"
+                    )
+
+                    new_location = new_location + "." + nlkey + ".txt"
+                    if os.path.exists(new_location):
+                        nlkey = util.sha256_file(new_location)
+                        if key == nlkey:
+                            util.dbg(
+                                3, new_location + " already exists, skipping..."
+                            )
+                            continue
+                        else:
+                            util.printerr("Something very wrong with db...")
+                            continue
+
+                    util.printinfo("Saving to " + new_location)
+
+            try:
+                with open(new_location, "wb") as f:
+                    f.writelines(self.db[key]['file'])
+            except:
+                util.printerr("Couldn't recreate file: " + new_location)
+
+        return True
+
+    def copy_into_lpath(self, fpath, name=None):
+        """
+        Copy src file to dst file and insert into db
+        safe to call from multiprocess context, except key
+        will NOT be inserted into actual db.
+        """
+
+        try:
+            if not os.path.getsize(fpath):
+                util.printerr("'%s' is 0 sized" % fpath)
+                return None
+        except:
+            util.printerr("Cannot access '%s'" % fpath)
+            return None
+
+        if not os.path.isfile(fpath):
+            util.printerr("'%s' does not exist" % fpath)
+            return None
+
+        key = util.sha256_file(fpath)
+        if key in self.db:
+            return self.db[key]['location']
+
+        if name is None:
+            npath = self.lpath + '/' + str(key) + ".txt"
+        else:
+            npath = self.lpath + '/' + os.path.basename(name) + ".txt"
+
+        shutil.copyfile(fpath, npath)
+        self.insert(npath)
+        return npath
+
+    def insert(self, location, override=False):
+        """
+        Insert into db, will override old if flag is set
+        Not safe to call within multiprocess context (key will not be inserted)
+        """
+        key = util.sha256_file(location)
+        if key is None:
+            util.printerr("Cannot open " + location)
+            return False
+
+        if override is False and key in self.db:
+            util.dbg(2, "'%s' already inserted, not updating" % key)
+            return True
+
+        name = os.path.basename(location)
+        if key in self.db:
+            util.dbg(2, name + " already inserted, overwriting entry")
+            util.dbg(5, "Old Key: \n\t" + str(self.db[key]))
+
+        self.db[key] = {}
+        self.db[key]['name'] = name
+        self.db[key]['location'] = location
+        self.db[key]['mtime'] = time.ctime(os.path.getmtime(location))
+        with open(location, 'rb') as f:
+            self.db[key]['file'] = f.readlines()
+
+        if key in self.db:
+            util.dbg(2, "New Key Inserted (%s):" % key)
+            util.dbg(4, "\t" + str(self.db[key]))
+
+        return True
+
+    def recreatedb(self):
+        """Recreate db from self.lpath fully"""
+        # Backup to lpath, clear, then initdb
+        util.remove_dups(self.lpath)
+        self.db = {}
+        self.initdb(first_load=False, override=False)
+
+    def refreshdb(self):
+        """Backup to lpath, then initdb with override"""
+        self.recreate_file_list(self.lpath)
+        self.initdb(first_load=False, override=True)
+
+    def initdb(self, first_load=False, override=False):
+        """Read through list-of-licenses dir and create license db if req'd"""
+        if first_load is True:
+            # Load db first
+            self.loaddb()
+            self.recreate_file_list(self.lpath)
+
+        for root, dirs, files in os.walk(self.lpath):
+            for f in files:
+                self.insert(os.path.join(root, f), override=override)
+
+        if override:
+            # Recreate to maintain sync
+            self.recreate_file_list(self.lpath)
+
+        self.savedb()
+
+    def printdb(self):
+        """Print out DB in specific format"""
+        for key in sorted(self.db, key=lambda x:self.db[x]['name']):
+            print key
+
+            print "\tName: " + self.db[key]['name']
+            print "\tLocation: " + self.db[key]['location']
+            print "\tLast Modified Time: " + self.db[key]['mtime']
+            print ""
+
+class ProjectDataBase(DataBase):
+    """Class used to maintain project data base"""
+
+    def __init__(self, dbfile="./pdb.pickle"):
+        # Init Parent
+        DataBase.__init__(self, dbfile=dbfile)
+
+        # Keys into db
+        self.extra = "lscan.extramagickeyentry"
+        self.projects = "lscan.projectmagickeyentry"
+
+        self.db[self.projects] = {} # Holds info on individual projects
+        self.db[self.extra] = {     # An almost relational entry
+            'installed' : {},       # Holds installed_extra info
+            'projects'  : {},       # Holds projects_extra info
+            'android'   : False,    # If project was an Android Project
+            'target'    : "",       # If Android, what target did we look at
+            'adir'      : "",       # If Android, adir
+            'obj_dir'   : "",       # If Android, obj_dir
+            'out_dir'   : "",       # If Android, obj_dir
+            'spath'     : "",       # Strip this from path
+        }
+
+        # Deepcopy these per installed file
+        self.installed_extra = {
+            'pfiles'   : {},    # pfiles associated with installed file
+            'plines'   : [],    # all lines in pfiles
+            'pdirs'    : {},    # all pdirs in pfiles
+            'deps'     : [],    # dependencies found TODO: Needed?
+            'location' : "",    # installed location e.g. /system
+        }
+
+        # Deepcopy these per project
+        self.projects_extra = {
+            'assoc-files' : [], # Installed files associated with project
+        }
+
+    def __del__(self):
+        """R.I.B."""
+        pass
+
+    def insert(self, project, project_location, license_list,
+               disclaimer, override=False, append=False):
+        """Insert into db, will override old if flag is set"""
+        key = project
+        if key is None:
+            util.printwarning("Key is none, bailing...")
+            return False
+
+        if append and key in self.db[self.projects]:
+            util.dbg(1, "Adding new info to'%s'" % key)
+
+            if self.db[self.projects][key]['project_location'] \
+               != project_location:
+                if override:    # If override, then rewrite
+                    self.db[self.projects][key]['project_location'] \
+                        = project_location
+
+            self.db[self.projects][key]['license_list'] += license_list
+            self.db[self.projects][key]['license_list'] = list(
+                set(self.db[self.projects][key]['license_list'])
+            )
+
+            for d in disclaimer:
+                if d in self.db[self.projects][key]['disclaimer']:
+                    continue
+                self.db[self.projects][key]['disclaimer'][d] = disclaimer[d]
+
+            return True
+
+        elif override is False and key in self.db[self.projects]:
+            util.dbg(1, "'%s' already in db, not updating" % key)
+            return False
+        elif key in self.db[self.projects]:
+            util.dbg(1, "'%s' already in db, updating info" % key)
+
+        self.db[self.projects][key] = {}
+        self.db[self.projects][key]['project_location'] = project_location
+        self.db[self.projects][key]['license_list'] = license_list
+        self.db[self.projects][key]['disclaimer'] = disclaimer
+
+        if key in self.db[self.projects]:
+            util.dbg(2, "New Key Inserted (%s):" % key)
+            util.dbg(4, "\t" + str(self.db[self.projects][key]))
+
+        return True
+
+    def initdb(self):
+        """Load self.db if exists, or blank"""
+        self.loaddb()
+
+    def printdb(self):
+        """Print out DB in specific format"""
+        for key in sorted(self.db[self.projects]):
+            print "\Project Name: " + key
+            print "\tProject Location: " + str(
+                self.db[self.projects][key]['project_location']
+            )
+            print "\tLicense List: "
+            for n,l in self.db[self.projects][key]['license_list']:
+                if n is not None and l is not None:
+                    sys.stdout.write("\t - " + n + ":" + l + "\n")
+            print "\tDisclaimer:"
+            for d in self.db[self.projects][key]['disclaimer']:
+                sys.stdout.write("\t %s:\n" % str(d))
+                for line in self.db[self.projects][key]['disclaimer'][d]:
+                    sys.stdout.write("\t " + line)
+            print ""
+
+class ProjectScanner(object):
+    """Class to scan/iterate over directory looking for projects"""
+
+    def __init__(self, ldb, pdb, pdirs=None, jobs=1, cached=False):
+        self.ldb = ldb
+        self.pdb = pdb
+        self.pdirs = pdirs
+        self.jobs = jobs
+        self.cached = cached
+
+        self._append_to_db = False
+
+        self.generic_lock = multiprocessing.Lock()
+        self.fs_lock = multiprocessing.Lock()
+        self.semaphore = multiprocessing.Semaphore(self.jobs)
+
+        self.license_file_list = [
+            "*LICENSE*",
+            "*LICENCE*",
+            "*License*",
+            "*COPYING*",
+            "*COPYRIGHT*",
+            "*COMMON*",
+            "*NOTICE*",
+            "*NOTISE*",
+            "*EULA*",
+            "*proprietary-blobs*"
+        ]
+        # All files under these dir names get added
+        self.license_dir_list = [
+            "Licenses",
+        ]
+        # Used for disclaimers found
+        self.disclaimer_file_list = [
+            "*patent_disclaimer.txt", "*PATENT*", "*disclaimer*",
+            "proprietary-blobs.txt"
+        ]
+        self.search_file_list = [
+            "*README", "*README.*", "*Makefile", "*.c", "*.h", "*.java",
+            "*.cpp", "*.cc", "*.py", "*.xml", "*.S", "*.sh",
+        ]
+
+
+    def __del__(self):
+        """R.I.B."""
+        pass
+
+    def get_cblock(self, fpath):
+        """Return copyright comment block"""
+        try:
+            self.fs_lock.acquire()
+            f = open(fpath, 'rb')
+            self.fs_lock.release()
+        except:
+            return []
+
+        cbegin = False
+        cend   = False
+        cfound = False
+        cblock = []
+        hashflag = False
+        # Read top comment block for licensing info
+        while True:
+            if cend:
+                break
+            lines = f.readlines(util.readinsize)
+            if not lines:
+                break
+            for line in lines:
+                if not cbegin:
+                    if "/*" in line or \
+                       "<!--" in line or \
+                       line.startswith("//") or \
+                       line.startswith("#"):
+                        if line.startswith("#"):
+                            hashflag = True
+                        cbegin = True
+                if cbegin:
+                    # Silly way to strip imo, but it's easy to read
+                    nline = line.strip(' ').lstrip('*').lstrip('#'). \
+                            rstrip('/').lstrip('/').lstrip('/').lstrip('*'). \
+                            replace('-->', "", 1).replace('<!--', "", 1). \
+                            strip(' ')
+
+                    if "copyright" in line.lower() or \
+                       "warranty" in line.lower() or \
+                       "(c)" in line.lower():
+                        cfound = True
+                    if hashflag and "#" not in line and line.strip() != "":
+                        cend = True
+                        break
+                    elif "*/" in line or \
+                         "-->" in line:
+                        cend = True
+                        cblock.append(nline)
+                        break
+                    cblock.append(nline)
+
+        self.fs_lock.acquire()
+        f.close()
+        self.fs_lock.release()
+        if cfound:
+            return cblock
+        else:
+            return []
+
+    def dir_scan(self, q, info):
+        """
+        Match licenses/disclaimers and return a dict with
+        'license_list' and 'disclaimer' filled out
+        Info: info = {
+                'location' : location,
+                'pname'    : os.path.basename(location),
+                'retval'   : [],
+              }
+        """
+
+        self.semaphore.acquire()
+
+        util.dbg(2, "Starting scan of '%s'" % info['location'])
+
+        retval = {'license_list' : [], 'disclaimer' : {}}
+
+        # Attempt to determine license from fastest to slowest method
+        fpaths = []
+        for root, dirs, files in os.walk(info['location']):
+            for f in files:
+                fpaths.append(os.path.join(root, f))
+
+        # Scan for known names in each dir
+        for pattern in self.license_file_list:
+            names = fnmatch.filter(fpaths, pattern)
+            for fpath in names:
+                if "MODULE_LICENSE" in fpath:
+                    continue
+                util.dbg(2, "matching license file: %s" % fpath)
+                # insert into ldb and get license key
+                self.fs_lock.acquire()
+                spath = self.ldb.copy_into_lpath(fpath)
+                self.fs_lock.release()
+                if spath:
+                    retval['license_list'].append(
+                        (fpath, util.sha256_file(spath))
+                    )
+
+        # Also add any lic's found in dirs maching self.license_dir_list
+        for d in self.license_dir_list:
+            names = util.find_dir(d, info['location'])
+            for dpath in names:
+                for f in os.listdir(dpath):
+                    fpath = dpath + "/" + f
+                    # insert into ldb and get license key
+                    self.fs_lock.acquire()
+                    spath = self.ldb.copy_into_lpath(fpath)
+                    self.fs_lock.release()
+                    if spath:
+                        retval['license_list'].append(
+                            (fpath, util.sha256_file(spath))
+                        )
+
+        # Scan for common phrases to try and match a license (slow)
+        if len(retval['license_list']) == 0:
+            for pattern in self.search_file_list:
+                names = fnmatch.filter(fpaths, pattern)
+                for fpath in names:
+                    # Search for 'copyright' term (case in-sensitive)
+                    cblock = self.get_cblock(fpath)
+                    # if cfound, dump contents into name.sha
+                    if not len(cblock) == 0:
+                        tmp = '_' + util.sha256_file(fpath)
+                        tpath = fpath.strip(pattern) + tmp
+
+                        self.fs_lock.acquire()
+                        with open(tpath, "wb") as f:
+                            f.writelines(cblock)
+                        spath = self.ldb.copy_into_lpath(tpath)
+                        self.fs_lock.release()
+
+                        retval['license_list'].append(
+                            (fpath, util.sha256_file(spath))
+                        )
+
+                        # remove tpath file (leave sha'd version only)
+                        self.generic_lock.acquire()
+                        os.remove(tpath)
+                        self.generic_lock.release()
+
+        # See if any files in path match a known sha if license_list is 0
+        if len(retval['license_list']) == 0:
+            for fpath in fpaths:
+                key = util.sha256_file(fpath)
+                try:
+                    if self.ldb.db[key]:
+                        retval['license_list'].append((fpath, key))
+                except:
+                    pass
+
+        # Look for any disclaimers e.g. patent files
+        disclaimers = {}
+        for pattern in self.disclaimer_file_list:
+            names = fnmatch.filter(fpaths, pattern)
+            for fpath in names:
+                self.fs_lock.acquire()
+                with open(fpath, "rb") as f:
+                    disclaimers[fpath] = f.readlines() # Should be short
+                self.fs_lock.release()
+        retval['disclaimer'] = disclaimers
+
+        if len(retval['license_list']) == 0:
+            util.printerr("Can't find license info for %s" % info['location'])
+
+        retval['license_list'] = list(set(retval['license_list'])) # Uniquify
+        info['retval'] = retval
+
+        util.dbg(2, "Scan complete of '%s'" % info['location'])
+
+        self.semaphore.release()
+
+        # Put data on the queue and kill process
+        q.put(info)
+
+    def populate_db(self, pdirs=None):
+        """Go through each project directory"""
+        util.dbg(
+            1, "Running ProjectScanner.populate_db"
+        )
+
+        if pdirs is None:
+            pdirs = self.pdirs
+
+        if pdirs is None:
+            util.printerr("No project directories passed in")
+            return
+
+        procs = []
+        q = multiprocessing.Queue(0)
+        for plocation in pdirs:
+            location = os.path.abspath(plocation)
+            if not os.path.isdir(location):
+                util.printerr("'%s' dir does not exist, skipping" % location)
+                continue
+
+            util.dbg(2, "Starting scan on %s" % location)
+            info = {
+                'location' : location,
+                'pname'    : os.path.basename(location),
+                'retval'   : None,
+            }
+
+            p = multiprocessing.Process(target=self.dir_scan, args=(q, info))
+            procs.append(p)
+
+        tmp_data = util.run_jobs(
+            procs, q,
+            maxjobs=self.jobs if self.cached else 1
+        )
+        # Finally, insert into pdb
+        for info in tmp_data:
+            self.pdb.insert(
+                info['pname'], info['location'],
+                info['retval']['license_list'], info['retval']['disclaimer'],
+                override=True, append=True
+            )
+
+        # Recreate database fully after scanner is done
+        self.ldb.recreatedb()
+
+class AndroidScanner(ProjectScanner):
+    """Create list of projects that we have installed"""
+
+    def __init__(self, ldb, pdb, adir, target, jobs, cached):
+        ProjectScanner.__init__(self, ldb=ldb, pdb=pdb, jobs=jobs, cached=cached)
+        self.adir = os.path.abspath(adir)
+        self.target = target
+        self.out_dir = os.path.abspath(
+            self.adir + '/out/target/product/' + self.target
+        )
+        self.obj_dir = os.path.abspath(
+            self.out_dir + '/' + 'obj/'
+        )
+
+        self.obj_search_dirs = [ # Order can matter
+            "EXECUTABLES", "SHARED_LIBRARIES", "STATIC_LIBRARIES",
+            "e2fsck",
+        ]
+        self.find_installed_list_dirs = [ # Order doesn't matter
+            "/system", "/root", "/boot"
+        ]
+        self.skip_file_list = [ # Order doesn't matter
+            "NOTICE.html.gz", "build.prop", "default.prop", "event-log-tags",
+            "recovery-resource.dat", "uramdisk.img",
+        ]
+        self.proj_skip_dirs = [ # Don't search for .mk files here
+            "ndk", "out", "pdk", ".repo", "sdk", "test-builds"
+        ]
+        self.proj_search_dirs = []
+        for proj in os.listdir(self.adir):
+            if proj in self.proj_skip_dirs:
+                continue
+            if os.path.isdir(self.adir + "/%s" % proj):
+                self.proj_search_dirs.append(proj)
+
+        self.any_match_pattern = [
+            ".*\.ttf", ".*\.kl", ".*\.bin", ".*\.png", ".*\.dat",
+            ".*\.so", ".*\.zip", ".*\.idc", ".*\.kcm", ".*\.bmd",
+        ]
+
+        # Create list of mk files
+        # Get's populated elsewhere when req'd
+        self.mk_files = []
+
+        # Create db of which files contain LOCAL_PACKAGE_NAME :=,
+        # LOCAL_MODULE := etc
+        # Get's populated elsewhere when req'd
+        self.not_found_pname_dict = {}
+
+        self.pdb.db[self.pdb.extra]['android'] = True
+        self.pdb.db[self.pdb.extra]['target'] = self.target
+        self.pdb.db[self.pdb.extra]['adir'] = self.adir + '/'
+        self.pdb.db[self.pdb.extra]['out_dir'] = self.out_dir
+        self.pdb.db[self.pdb.extra]['obj_dir'] = self.obj_dir
+
+    def __del__(self):
+        """R.I.B."""
+        pass
+
+    def parse_mk_file_line_for_term(self, line, term, append_name):
+        # split : would mean it's a copy file
+        ret = []
+        aflag = False
+
+        line = line.strip()
+        if line.endswith("= " + term):
+            aflag = True
+
+        elif line.endswith("= " + term.replace(".so", "_common_static", 1)):
+            aflag = True
+
+        elif term in line:
+            tmp = []
+            for i in line.split(':'):
+                tmp.append(i.strip('\\').strip())
+
+            if len(tmp) == 2:
+                aflag = tmp[1].endswith(term) # set second option
+                # Also append tmp[0] as fname
+                if aflag and \
+                   os.path.exists(self.adir + '/%s' % tmp[0]):
+                    ret.append(self.adir + '/%s' % tmp[0])
+                    return ret  # Don't return .mk location that copied file
+
+            # This is not a good method
+            if not aflag:
+                sline = line.strip('\\').strip()
+                for pattern in self.any_match_pattern:
+                    if not re.match(pattern, term):
+                        continue
+                    if re.match(pattern, sline):
+                        aflag = True
+                        break
+
+        if aflag:
+            ret.append(append_name)
+
+        return ret
+
+    # TODO: When searching, look for str. LOAD_STATIC_JAVA_LIBRARIES and add
+    # those to our pdirs list
+    def search_mk_files(self, q, info):
+        """
+        Ret. file if it contains anything matching info['searchme']
+        info = {
+            'fname.magic'     : filename to look into,
+            'pdb.extra'      : {dict of search terms for pdb.extra pdb entry},
+            'term.magic'      : {matching files dict for searchme term}
+        }
+        """
+        self.semaphore.acquire()
+
+        with open(info['fname.magic'], "rb") as f:
+            while True:
+                lines = f.readlines(util.readinsize)
+                if not lines:
+                    break
+                for line in lines:
+                    for term in info['searchme.magic']:
+                        ret = self.parse_mk_file_line_for_term(
+                            line, term, info['fname.magic']
+                        )
+                        if not len(ret) == 0:
+                            try:
+                                info[term] += ret
+                            except:
+                                info[term] = ret
+
+        self.semaphore.release()
+        q.put(info)
+        exit(0)
+
+    def get_mk_files(self, q, info):
+        """
+        Return list of .mk files found in self.proj_search_dirs
+        info = {
+            "proj_dir" : str,
+             mk_files   : []
+        }
+        """
+
+        self.semaphore.acquire()
+
+        info['mk_files'] = util.find_file_p(
+            "*.mk", self.adir + "/%s/" % info['proj_dir']
+        )
+
+        self.semaphore.release()
+        q.put(info)
+        exit(0)
+
+    def get_P_files(self, q, info):
+        """
+        Get .P file list for given installed file.
+            info = {
+                "name"        : installed,
+                "plist"       : [],
+                "git_project" : False,
+                "android_mk"  : False,
+            }
+        """
+
+        self.semaphore.acquire()
+
+        obj_location = []
+        for sdir in self.obj_search_dirs:
+            obj_location = util.find_file(
+                info['name'],
+                self.obj_dir + '/' + sdir
+            )
+            if obj_location:
+                break
+
+        # If nothing found, try to see if tool is apart of 'toolbox' from PACKAGING dir
+        if len(obj_location) == 0:
+            ret = util.find_file(info['name'], self.obj_dir + "/PACKAGING")
+            for f in ret:
+                # determine if prog. is symlinked
+                try:
+                    link_name = os.readlink(f)
+                except:
+                    link_name = None
+
+                obj_location = util.find_file(
+                    link_name,
+                    self.obj_dir + "/EXECUTABLES"
+                )
+                break
+
+        # Nothing Found...
+        if len(obj_location) == 0:
+            self.semaphore.release()
+            util.dbg(2,
+                "No .P files found for %s" % info['name']
+            )
+            q.put(info)
+            return
+
+        # Get to 'intermediates' dir and find .P files
+        tmp_obj_location = []
+        for obj in obj_location:
+            p = os.path.abspath(os.path.join(obj, os.pardir))
+            while True:
+                if "obj" in os.path.basename(p):
+                    break
+                # Only add location if intermediates found on top
+                if os.path.basename(p).endswith("intermediates"):
+                    tmp_obj_location.append(p)
+                    break
+                p = os.path.abspath(os.path.join(p, os.pardir))
+
+        tmp_obj_location = list(set(tmp_obj_location))
+        for d in tmp_obj_location:
+            info['plist'] += util.find_file_p("*.P", os.path.abspath(d))
+
+        self.semaphore.release()
+        q.put(info)
+        exit(0)
+
+    def cleanup_pfile_line(self, line):
+        lines = []
+
+        # Strip '\' and ':' chars
+        nline = line.translate(None, '\\:')
+
+        # Newline each ' '
+        split = nline.split(' ')
+        for s in split:
+            s = s.strip(' ')
+            # Don't add certain lines
+            if s.endswith(".o") or \
+               s == self.adir or \
+               "out/target/product/" in s:
+                continue
+
+            lines.append(s)
+
+        return lines
+
+    def collapse_pfiles(self, installed_info):
+        """
+        Join installed_info['plist']
+            installed_info = {
+                "name"        : installed, # installed file name
+                "plist"       : [], # .P file list
+                "git_project" : False,
+                "android_mk"  : False,
+            }
+        """
+        collapsed_info= {}
+        for info in installed_info:
+            # Insert info into spec. key for later relationing
+            if len(info['plist']) == 0:
+                # Insert into db with no info
+                util.dbg(2, "Inserting empty entry '%s'" % info['name'])
+                self.pdb.insert(
+                    info['name'], "", [], []
+                )
+                continue
+
+            for pfile in info['plist']:
+                if pfile not in collapsed_info:
+                    collapsed_info[pfile] = {}
+                    collapsed_info[pfile]['names'] = []
+                    collapsed_info[pfile]['plines'] = []
+                    collapsed_info[pfile]['pdirs'] = {}
+
+                collapsed_info[pfile]['names'].append(info['name'])
+
+        # For further parsing
+        for pfile in collapsed_info:
+            with open(pfile, "rb") as f:
+                tmp_lines = f.readlines(util.readinsize)
+                if not tmp_lines:
+                    break
+                for line in tmp_lines:
+                    if len(line) <= 1:
+                        continue
+                    collapsed_info[pfile]['plines'] \
+                        += self.cleanup_pfile_line(line)
+
+        return collapsed_info
+
+    def get_pdirs_from_files_mt(self, q, info):
+        """
+        info = {
+            'files' : file list
+            'pdir'  : ret from find_pdirs_from_files
+        }
+        """
+
+    def find_pdirs_from_files(self, files):
+        """
+        Find pdir of each file passed in
+        pdirs = {
+            "pdir" : pdir,
+            "aflag" : aflag,
+        }
+        """
+
+        pdirs = {}
+        # Search each line for Android.mk and .git, and when found, call it the
+        # pdir
+        for line in files:
+            # Skip empties
+            if len(line) <= 1:  # small line, skip
+                continue
+
+            # Get current dir
+            if self.adir in line:
+                line_dir =  os.path.abspath(os.path.dirname(line))
+            else:
+                line_dir = os.path.abspath(
+                    os.path.dirname(self.adir + "/" + line)
+                )
+            util.dbg(2, "Parsing %s..." % line_dir)
+
+            pdir = util.find_name_in_parent_dirs(
+                ".git", line_dir, self.adir,
+                dirflag=True, fileflag=False
+            )
+            if not pdir:
+                util.printerr("Couldn't find %s" % line_dir)
+            else:
+                aflag = False
+                for f in os.listdir(pdir):
+                    if f.endswith("Android.mk"):
+                        aflag = True
+                        break
+
+                pdirs[os.path.basename(pdir)] = {
+                    "pdir" : pdir,
+                    "aflag" : aflag,
+                }
+
+        return pdirs
+
+    def phase1_populatedb(self):
+        """Attempt to fill in empty db entries in roundabout ways"""
+        util.dbg(
+            1, "Running AndroidScanner.phase1_populatedb"
+        )
+
+        pdirs = []
+        remove_from_pdb_list = []
+        insert_into_pdb_list = []
+        not_in_mk_list = []
+        # populate global not_found_pname_dict
+        for db_key in self.pdb.db[self.pdb.projects]:
+            if len(self.pdb.db[self.pdb.projects][db_key]['license_list']) == 0:
+                if db_key.endswith(".apk") or \
+                   db_key.endswith(".jar"):
+                    key = os.path.splitext(db_key)[0]
+                    self.not_found_pname_dict[key] = []
+                    remove_from_pdb_list.append(db_key)
+                else:
+                    self.not_found_pname_dict[db_key] = []
+
+        # Should probably not multiprocess this section
+        procs = []
+        q = multiprocessing.Queue(0)
+        for d in self.proj_search_dirs:
+            info = {
+                'proj_dir' : d,
+                'mk_files' : []
+            }
+            p = multiprocessing.Process(target=self.get_mk_files, args=(q, info))
+            procs.append(p)
+
+        tmp_info = util.run_jobs(
+            procs, q,
+            maxjobs=1
+        )
+        for info in tmp_info:
+            self.mk_files += info['mk_files']
+
+        # android fs that we care about should be cached in memory now
+        # hopefully we don't trample all over it with the next few
+        # multiprocessor calls... assume that a machine building android can
+        # handle this
+        self.cached = True
+
+        # Populate not_found_pname_dict
+        procs = []
+        q = multiprocessing.Queue(0)
+        for file in self.mk_files:
+            info = {
+                'fname.magic'     : file,
+                'searchme.magic'  : self.not_found_pname_dict,
+                'term.magic'      : {}
+            }
+            p = multiprocessing.Process(
+                target=self.search_mk_files, args=(q, info)
+            )
+            procs.append(p)
+
+        tmp_info = util.run_jobs(procs, q)
+        for info in tmp_info:
+            for term in info:
+                # These .mk files had search terms attached to them
+                if term.endswith(".magic"):
+                    continue
+
+                self.not_found_pname_dict[term] += info[term]
+
+        # TODO: Should I bother multithreading this section?
+        for pname in self.not_found_pname_dict:
+            ret = []
+            if not len(self.not_found_pname_dict[pname]) == 0:
+                assoc = util.reassoc(pname, remove_from_pdb_list)
+                if assoc not in self.pdb.db[self.pdb.extra]['installed']:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc] = {}
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] = []
+
+                self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] += [
+                    i for i in self.not_found_pname_dict[pname]
+                ]
+
+                # d = project dir pname is associated with
+                self.not_found_pname_dict[pname] = list(set(self.not_found_pname_dict[pname]))
+                for d in self.not_found_pname_dict[pname]:
+                    _d = d
+                    if not os.path.isdir(_d):
+                        _d = os.path.dirname(_d)
+                    tmp_ret = util.find_name_in_parent_dirs(
+                        ".git", os.path.abspath(_d), self.adir,
+                        dirflag=True, fileflag=False
+                    )
+                    ret.append(tmp_ret)
+
+                    # Install into pdb.db[self.pdb.extra]
+                    s = os.path.basename(tmp_ret)
+                    if s not in self.pdb.db[self.pdb.extra]['projects']:
+                        self.pdb.db[self.pdb.extra]['projects'][s] = (
+                            copy.deepcopy(self.pdb.projects_extra)
+                        )
+
+                    self.pdb.db[self.pdb.extra]['projects'][s] \
+                        ['assoc-files'].append(assoc)
+
+                if len(ret) == 0:
+                    util.printerr("Couldn't find pdirs for %s" % pname)
+                    insert_into_pdb_list.append(pname)
+                    continue
+
+            else:
+                util.dbg(2, "Couldn't find %s in any .mk files" % pname)
+                # Try to find actual file in search dirs
+                not_in_mk_list.append(pname)
+
+            # This 'project' is a bad shim, remove it completely
+            for r in ret:
+                if "frameworks/opt/mms" in r:
+                    ret.remove(r)
+            pdirs += ret
+            remove_from_pdb_list.append(pname)
+
+        # Attempt to find files still not found
+        get_pdir_list = []
+        for path in self.proj_search_dirs:
+            for root, dirs, files in os.walk(self.adir + "/%s/" % path):
+                for pname in not_in_mk_list:
+                    if pname in files:
+                        assoc = util.reassoc(pname, remove_from_pdb_list)
+                        if assoc not in self.pdb.db[self.pdb.extra]['installed']:
+                            self.pdb.db[self.pdb.extra]['installed'][assoc] = {}
+                            self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] = []
+
+                        self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'].append(root)
+                        util.dbg(2, "Adding %s to installed %s" % (root, assoc))
+                        get_pdir_list.append(pname)
+
+        get_pdir_list = list(set(get_pdir_list))
+        for pname in get_pdir_list:
+            assoc = util.reassoc(pname, remove_from_pdb_list)
+            ret = []
+            for d in self.pdb.db[self.pdb.extra]['installed'][assoc]['deps']:
+                _d = d
+                if not os.path.isdir(_d):
+                    _d = os.path.dirname(_d)
+                tmp_ret = util.find_name_in_parent_dirs(
+                    ".git", os.path.abspath(_d), self.adir,
+                    dirflag=True, fileflag=False
+                )
+                ret.append(tmp_ret)
+
+                # Install into pdb.db[self.pdb.extra]
+                s = os.path.basename(tmp_ret)
+                if s not in self.pdb.db[self.pdb.extra]['projects']:
+                    self.pdb.db[self.pdb.extra]['projects'][s] = (
+                        copy.deepcopy(self.pdb.projects_extra)
+                    )
+
+                self.pdb.db[self.pdb.extra]['projects'][s] \
+                    ['assoc-files'].append(assoc)
+
+            if len(ret) == 0:
+                util.printerr("Couldn't find pdirs for %s" % pname)
+                insert_into_pdb_list.append(pname)
+                continue
+            else:
+                pdirs += ret
+                remove_from_pdb_list.append(pname)
+
+        # List should be wittled down quite a bit, try to manually add files
+        for pname in not_in_mk_list:
+            assoc = util.reassoc(pname, remove_from_pdb_list)
+            if assoc not in self.pdb.db[self.pdb.extra]['installed']:
+                util.printerr("%s not in installed list, skipping" % assoc)
+                continue
+            if len(self.pdb.db[self.pdb.extra]['installed'][assoc]['deps']) == 0:
+                if "6x_bootscript-ventana" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/device/gateworks/ventana"
+                    self.pdb.db[self.pdb.extra]['projects']['gateworks'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "liblogwrap.so" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/system/core/logwrapper/"
+                    self.pdb.db[self.pdb.extra]['projects']['core'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "libnl.so" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/external/libnl/"
+                    self.pdb.db[self.pdb.extra]['projects']['libnl'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "libwebrtc_audio_preprocessing.so" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/external/webrtc/"
+                    self.pdb.db[self.pdb.extra]['projects']['webrtc'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "mini-emulator-x86_64" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/"
+                    self.pdb.db[self.pdb.extra]['projects']['ventana'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "ueventd" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/system/core/init"
+                    self.pdb.db[self.pdb.extra]['projects']['core'] \
+                        ['assoc-files'].append(assoc)
+
+                elif "watchdogd" in assoc:
+                    self.pdb.db[self.pdb.extra]['installed'][assoc]['deps'] \
+                        = self.adir + "/system/core/init/"
+                    self.pdb.db[self.pdb.extra]['projects']['core'] \
+                        ['assoc-files'].append(assoc)
+
+        for pname in get_pdir_list:
+            assoc = util.reassoc(pname, remove_from_pdb_list)
+            ret = []
+            for d in self.pdb.db[self.pdb.extra]['installed'][assoc]['deps']:
+                _d = d
+                if not os.path.isdir(_d):
+                    _d = os.path.dirname(_d)
+                tmp_ret = util.find_name_in_parent_dirs(
+                    ".git", os.path.abspath(_d), self.adir,
+                    dirflag=True, fileflag=False
+                )
+                ret.append(tmp_ret)
+
+                # Install into pdb.db[self.pdb.extra]
+                s = os.path.basename(tmp_ret)
+                if s not in self.pdb.db[self.pdb.extra]['projects']:
+                    self.pdb.db[self.pdb.extra]['projects'][s] = (
+                        copy.deepcopy(self.pdb.projects_extra)
+                    )
+
+                self.pdb.db[self.pdb.extra]['projects'][s] \
+                    ['assoc-files'].append(assoc)
+
+            if len(ret) == 0:
+                util.printerr("Couldn't find pdirs for %s" % pname)
+                insert_into_pdb_list.append(pname)
+                continue
+            else:
+                pdirs += ret
+                remove_from_pdb_list.append(pname)
+
+        # Couldn't find info on these...
+        for pname in not_in_mk_list:
+            assoc = util.reassoc(pname, remove_from_pdb_list)
+            if assoc not in self.pdb.db[self.pdb.extra]['installed'] or \
+               len(self.pdb.db[self.pdb.extra]['installed'][assoc]['deps']) == 0:
+                util.printerr("Can't find location of %s" % assoc)
+                insert_into_pdb_list.append(pname)
+
+        # Remove entries from pdb
+        remove_from_pdb_list = list(set(remove_from_pdb_list))
+        for key in remove_from_pdb_list:
+            self.pdb.db[self.pdb.projects].pop(key, None)
+
+        # Add entries from pdb
+        insert_into_pdb_list = list(set(insert_into_pdb_list))
+        for key in insert_into_pdb_list:
+            if key not in self.pdb.db[self.pdb.extra]:
+                self.pdb.insert(key, "", [], [])
+
+        # Search for proj_search_dirs for interesting pdirs to add
+        for proj in self.proj_search_dirs:
+            if "kernel" in proj or \
+               "bootable" in proj:
+                # Find .git's for proj dirs within
+                git_dirs = util.find_dir(".git", self.adir + "/%s/" % proj)
+                for gd in git_dirs:
+                    path = os.path.abspath(os.path.join(gd, os.pardir))
+                    if len(os.listdir(path)) == 1:
+                        continue
+                    pdirs.append(path)
+
+        # Uniquify
+        pdirs = list(set(pdirs))
+        for f in self.pdb.db[self.pdb.extra]['installed']:
+            try:
+                self.pdb.db[self.pdb.extra]['installed'][f]['deps'] \
+                    = list(set(
+                        self.pdb.db[self.pdb.extra]['installed'][f]['deps']
+                    ))
+            except KeyError:
+                pass
+
+        super(AndroidScanner, self).populate_db(pdirs)
+
+    def get_pdirs(self):
+        """Return pdirs for scanning"""
+        util.dbg(
+            1, "Running AndroidScanner.get_pdirs"
+        )
+
+        # First get list of installed files on system
+        pdirs = []
+        for installed_dir in self.find_installed_list_dirs:
+            for root, dirs, files in os.walk(self.out_dir + installed_dir):
+                for f in files:
+                    skip_flag = False
+                    for pattern in self.skip_file_list:
+                        if fnmatch.fnmatch(f, pattern):
+                            skip_flag = True
+                            util.printwarning("Skipping file %s" % f)
+                            break
+                    if not skip_flag:
+                        self.pdb.db[self.pdb.extra]['installed'][f] \
+                            = copy.deepcopy(self.pdb.installed_extra)
+                        self.pdb.db[self.pdb.extra]['installed'][f]['location'] \
+                            = os.path.join(root, f)
+
+        # Get '.P' files associated with installed file
+        procs = []
+        q = multiprocessing.Queue(0)
+        for installed in self.pdb.db[self.pdb.extra]['installed']:
+            info = {
+                'name'        : installed,
+                'plist'       : [],
+                'git_project' : False,
+                'android_mk'  : False,
+            }
+            p = multiprocessing.Process(target=self.get_P_files, args=(q, info))
+            procs.append(p)
+
+        installed_info = util.run_jobs(
+            procs, q,
+            maxjobs=self.jobs if self.cached else 1
+        )
+        # collapsed_info has following entries:
+        # collapsed_info[pfile] = {} pfile = .P file
+        # collapsed_info[pfile]['names'] = [] installed files .P is associated with
+        # collapsed_info[pfile]['plines'] = [] lines in .P
+        # collapsed_info[pfile]['pdirs'] = {} pdirs of .P files
+
+        collapsed_info = self.collapse_pfiles(installed_info)
+
+        # TODO: Multithread this section:
+        # for pfile in collapsed_info:
+        #     info = {
+        #         ''
+        #     }
+
+        for pfile in collapsed_info:
+            collapsed_info[pfile]['plines'] = list(
+                set(collapsed_info[pfile]['plines'])
+            )
+            collapsed_info[pfile]['pdirs'] = self.find_pdirs_from_files(
+                collapsed_info[pfile]['plines']
+            )
+
+        tmp_data = []
+        for pfile in collapsed_info:
+            # Create file assoc's
+            installed_files = collapsed_info[pfile]['names']
+            for pdir in collapsed_info[pfile]['pdirs']:
+                if pdir not in self.pdb.db[self.pdb.extra]['projects']:
+                    self.pdb.db[self.pdb.extra]['projects'][pdir] = (
+                        copy.deepcopy(self.pdb.projects_extra)
+                    )
+
+                self.pdb.db[self.pdb.extra]['projects'][pdir]['assoc-files'] \
+                    += installed_files
+
+            # Create pdir list to return
+            for data in collapsed_info[pfile]['pdirs']:
+                bn = os.path.basename(
+                    collapsed_info[pfile]['pdirs'][data]['pdir']
+                )
+                if bn not in self.pdb.db[self.pdb.extra]['projects']:
+                    self.pdb.db[self.pdb.extra]['projects'][bn] = (
+                        copy.deepcopy(self.pdb.projects_extra)
+                    )
+
+                tmp_data.append(collapsed_info[pfile]['pdirs'][data]['pdir'])
+                if not collapsed_info[pfile]['pdirs'][data]['pdir']:
+                    util.dbg(1, "%s did not have an Android.mk" % str(data))
+
+        return list(set(tmp_data))
+
+    def populate_db(self, pdirs=None):
+        """Override parent class to first get a list of dirs and call parent"""
+        self.pdirs = self.get_pdirs()
+        self.phase1_populatedb()
+        super(AndroidScanner, self).populate_db()
+
+        util.printinfo("Done populating %s" % self.pdb.name)
+
+def main():
+    opts = argparse.ArgumentParser(
+        description="Get licenses for a given project(s)",
+        prog="lscan"
+    )
+
+    # Debug Verbosity Level
+    opts.add_argument(
+        "-d", "--debug", dest="debug", default=0, help="Debug level"
+    )
+
+    # Android Flag
+    opts.add_argument(
+        "-a", "--android-dir", dest="adir", default=None,
+        help="Run for android build; Pass in root android build directory"
+    )
+
+    # Product Name (only if -a)
+    opts.add_argument(
+        "-t", "--target", dest="target", default="ventana",
+        help="Target that was built. Only applicable if -a (Default is ventana)"
+    )
+
+    # List of projects to scan
+    opts.add_argument(
+        "-p", "--project-dir", dest="pdirs", default=None, nargs='+',
+        help="Project directory to iterate over, not applicable if -a"
+    )
+
+    # License Dir
+    opts.add_argument(
+        "-l", "--license-dir", dest="ldir", default="./list-of-licenses",
+        help="License directory to create db on"
+    )
+
+    # create html output from input pdb.pickle
+    opts.add_argument(
+        "-c", "--create-output", dest="pdb", default="",
+        help="pdb.pickle file to create output on; will not scan"
+    )
+
+    # Number of jobs to run
+    opts.add_argument(
+        "-j", "--jobs", dest="jobs", default=multiprocessing.cpu_count(),
+        help="Max number of processes to use " +
+        "(default: %s)" % str(multiprocessing.cpu_count())
+    )
+
+    opts.add_argument(
+        "--cached", action="store_true", dest="cached",
+        help="If disk io operations were cached, pass in this hint flag"
+    )
+
+    # Output Filename
+    opts.add_argument(
+        "-f", "--file", nargs="?", type=argparse.FileType('w'),
+        default=sys.stdout,
+        help="Create file and output content there else output to stdout " +
+        "(Note, name will be used for HTML output as well)"
+    )
+
+    args = opts.parse_args()
+
+    # Setup utils
+    util.gdbg = int(args.debug)
+    util.jobs = int(args.jobs)
+
+    util.printwarning(
+        "Please do not ctrl-c program! If you do, manually cleanup processes"
+    )
+
+    # Setup license database
+    ldb = LicenseDataBase(lpath=args.ldir)
+    ldb.initdb(first_load=True, override=True)
+
+    if args.pdb:
+        pdb = ProjectDataBase(args.pdb)
+        pdb.initdb()
+        util.create_output(ldb, pdb)
+        return
+    else:
+        pdb = ProjectDataBase()
+
+    # Create either a generic scanner or android specific
+    if args.adir:
+        scanner = AndroidScanner(ldb, pdb, args.adir, args.target,
+                                 int(args.jobs), args.cached)
+    else:
+        scanner = ProjectScanner(ldb, pdb, args.pdirs,
+                                 int(args.jobs), args.cached)
+
+    scanner.populate_db()
+    pdb.savedb()
+    util.create_output(ldb, pdb)
+
+if __name__ == "__main__":
+    main()
